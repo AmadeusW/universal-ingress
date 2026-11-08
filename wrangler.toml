@@ -1,0 +1,8 @@
+name = "universal-ingress"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "universal_ingress_db"
+database_name = "universal-ingress-db"
+database_id = "42b4bdb9-4934-498b-b1f6-8d62242a5f62"
