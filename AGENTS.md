@@ -7,7 +7,8 @@ Webhook -> storage -> retrieval on Cloudflare Workers + D1. Keep it small and re
 - `src/auth.ts`: bearer, shared-secret and Twilio signature checks
 - `src/events.ts`: the only code that touches D1
 - `migrations/`: D1 schema, applied with wrangler
-- `src/.later.ts`: parked Durable Object push idea, not wired in
+- `src/watchers.ts`: Durable Object that holds watcher websockets and pushes new events (`GET /watch`)
+- `watch.py`: local watcher that connects to `/watch` and writes events into the Obsidian vault
 
 ## Conventions
 - Prefer plain, descriptive names and short functions over abstractions.

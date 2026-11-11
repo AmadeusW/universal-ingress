@@ -23,11 +23,6 @@ export function hasValidBearerToken(request: Request, expectedToken: string): bo
   return header.startsWith(prefix) && constantTimeEquals(header.slice(prefix.length), expectedToken);
 }
 
-/** True if the named header equals the shared secret. */
-export function hasValidSharedSecret(request: Request, headerName: string, expectedSecret: string): boolean {
-  return constantTimeEquals(request.headers.get(headerName) ?? "", expectedSecret);
-}
-
 /**
  * Verifies Twilio's X-Twilio-Signature header.
  * `url` must be exactly the URL Twilio was configured to call.
