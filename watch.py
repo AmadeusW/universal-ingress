@@ -27,9 +27,10 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import websockets
 import yaml
@@ -127,14 +128,11 @@ def pull_events(endpoint: str, after_seq: int, token: str) -> list[dict[str, Any
 
 
 def handle_event(event: dict[str, Any], cfg: dict[str, Any], logger: logging.Logger) -> None:
-    """Integrate an event unless already handled, then advance and save the cursor."""
+    """Integrate an event unless already handled. integrate_event advances the cursor."""
     seq = event.get("seq", 0)
     if seq <= int(cfg.get("last_seq", 0)):
         return  # delivery is at-least-once, so skip what we already handled
     integrate_event(event, cfg, logger)
-    cfg["last_seq"] = seq
-    save_config(cfg)
-    logger.info("Updated cursor last_seq to %d", seq)
 
 
 def extract_title(text: str, default: str = "Note") -> str:
@@ -267,13 +265,11 @@ def integrate_event(event: dict[str, Any], cfg: dict[str, Any], logger: logging.
     entry_lines = [
         f"## {title}",
         "",
-        transcription.strip(),
-        "",
-        "---",
+        f"[[verbal]({rel_att_path})]",
         "",
         f"> {transcription.strip()}",
         "",
-        f"Attachment: [[{rel_att_path}]]",
+        "---",
         "",
     ]
     entry_text = "\n".join(entry_lines)
@@ -302,6 +298,12 @@ def integrate_event(event: dict[str, Any], cfg: dict[str, Any], logger: logging.
     daily_file.write_text(updated_content, encoding="utf-8")
     logger.info("Integrated event into %s under '%s'", daily_file, title)
 
+    # Save cursor immediately after vault writes succeed
+    if seq is not None and int(seq) > int(cfg.get("last_seq", 0)):
+        cfg["last_seq"] = int(seq)
+        save_config(cfg)
+        logger.info("Updated cursor last_seq to %d", seq)
+
     if cfg.get("invoke_hermes", True):
         invoke_hermes_for_event(transcription, rel_att_path, daily_file, source, logger)
 
@@ -317,13 +319,13 @@ def invoke_hermes_for_event(
     prompt = f"""A new note was received via Universal Ingress from {source}:
 \"{transcription.strip()}\"
 
-Attachment: [[{rel_att_path}]]
+Attachment: [[verbal]({rel_att_path})]
 Daily Note: {daily_file}
 
 Please review the note:
 1. Check if the note asks you to do something, asks a question, or has clear action items.
 2. If it is actionable and safe to do, perform the requested work or research.
-3. Update the entry under '# Received notes' in {daily_file} to include your findings, answer, or resulting action above the '---' divider, while preserving the raw quote and attachment link below. If no action is needed, no edit is required.
+3. If actionable, update the entry under '# Received notes' in {daily_file} by placing your interpretation, answer, or findings between the attachment link and the blockquoted raw note (no horizontal line between interpretation and quote; keep the trailing '---' divider). If the interpretation is the same as the raw quote or no action is needed, no edit is required (leave only the quote).
 """
     logger.info("Invoking Hermes for event from %s...", source)
     try:
@@ -352,14 +354,60 @@ Please review the note:
         logger.error("Failed to invoke Hermes: %s", e)
 
 
-async def keepalive(ws: websockets.ClientConnection) -> None:
-    """Application-level ping; the server answers "pong" without waking its Durable Object."""
+def get_boottime() -> float:
+    """Return boottime in seconds (includes sleep/suspend time on Linux)."""
+    if hasattr(time, "CLOCK_BOOTTIME"):
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    return time.time()
+
+
+async def sleep_detector(ws: websockets.ClientConnection, logger: logging.Logger) -> None:
+    """Detect when the machine wakes from sleep and tear down the stale socket."""
+    check_interval = 3.0
+    last_time = get_boottime()
+    while True:
+        await asyncio.sleep(check_interval)
+        now = get_boottime()
+        gap = now - last_time
+        last_time = now
+        # If actual time jumped by more than check_interval + 5s, the system was suspended
+        if gap > check_interval + 5.0:
+            logger.info("System resumed from sleep (gap of %.1fs). Reconnecting websocket...", gap)
+            await ws.close()
+            break
+
+
+async def keepalive(ws: websockets.ClientConnection, last_seen: list[float], logger: logging.Logger) -> None:
+    """Application-level ping; the server answers 'pong' without waking its Durable Object."""
     while True:
         await asyncio.sleep(PING_INTERVAL_SECONDS)
-        await ws.send("ping")
+        # If no message or pong has been received in 2 ping intervals, connection is dead
+        idle = time.monotonic() - last_seen[0]
+        if idle > PING_INTERVAL_SECONDS * 2:
+            logger.warning("No pong/message received in %.1fs (connection dead). Reconnecting...", idle)
+            await ws.close()
+            break
+        try:
+            await ws.send("ping")
+        except Exception as e:
+            logger.warning("Failed to send keepalive ping: %s", e)
+            await ws.close()
+            break
 
 
-async def watch_once(cfg: dict[str, Any], token: str, logger: logging.Logger) -> None:
+async def process_events(queue: asyncio.Queue[dict[str, Any] | None], cfg: dict[str, Any], logger: logging.Logger) -> None:
+    """Handle queued events one at a time until a None sentinel arrives.
+
+    Runs separately from the socket reader so a slow event (Hermes can take minutes)
+    never stops us from reading pongs. handle_event runs in a thread to keep the loop free.
+    """
+    while (event := await queue.get()) is not None:
+        await asyncio.to_thread(handle_event, event, cfg, logger)
+
+
+async def watch_once(
+    cfg: dict[str, Any], token: str, logger: logging.Logger, on_connected: Callable[[], None]
+) -> None:
     """One connection: replay from the cursor, then handle events as they are pushed."""
     endpoint = cfg.get("watch_endpoint", DEFAULT_WATCH_ENDPOINT)
     last_seq = int(cfg.get("last_seq", 0))
@@ -373,16 +421,29 @@ async def watch_once(cfg: dict[str, Any], token: str, logger: logging.Logger) ->
         ping_interval=None,  # we send our own text pings
     ) as ws:
         logger.info("Connected")
-        ping_task = asyncio.create_task(keepalive(ws))
+        on_connected()
+        last_seen = [time.monotonic()]
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        worker = asyncio.create_task(process_events(queue, cfg, logger))
+        # If the worker dies (an event failed to integrate), drop the connection so the error surfaces below.
+        worker.add_done_callback(lambda _: asyncio.ensure_future(ws.close()))
+        watchdogs = [
+            asyncio.create_task(keepalive(ws, last_seen, logger)),
+            asyncio.create_task(sleep_detector(ws, logger)),
+        ]
         try:
             async for message in ws:
+                last_seen[0] = time.monotonic()
                 if message == "pong":
                     continue
                 for event in json.loads(message).get("events", []):
-                    # Run in a thread: Hermes can take minutes and must not stall the keepalive.
-                    await asyncio.to_thread(handle_event, event, cfg, logger)
+                    queue.put_nowait(event)
         finally:
-            ping_task.cancel()
+            for task in watchdogs:
+                task.cancel()
+        # Let the worker finish what it already has, so a reconnect can't replay an event still in flight.
+        queue.put_nowait(None)
+        await worker  # re-raises if an event failed
 
 
 def pull_once(cfg: dict[str, Any], token: str, logger: logging.Logger) -> None:
@@ -399,16 +460,23 @@ def pull_once(cfg: dict[str, Any], token: str, logger: logging.Logger) -> None:
 
 async def watch_forever(cfg: dict[str, Any], token: str, logger: logging.Logger) -> None:
     backoff = 1
+    connected_at: float | None = None
+
+    def mark_connected() -> None:
+        nonlocal connected_at
+        connected_at = time.monotonic()
+
     while True:
-        cursor_before = cfg.get("last_seq", 0)
+        connected_at = None
         try:
-            await watch_once(cfg, token, logger)
-            logger.warning("Connection closed by server")
+            await watch_once(cfg, token, logger, mark_connected)
+            logger.warning("Connection closed")
         except Exception as e:
             logger.warning("Connection lost: %s", e)
 
-        if cfg.get("last_seq", 0) != cursor_before:
-            backoff = 1  # we made progress, so the connection was healthy
+        # A connection that stayed up (even idle, even closed by our own sleep detector) was healthy.
+        if connected_at is not None and time.monotonic() - connected_at >= PING_INTERVAL_SECONDS:
+            backoff = 1
         logger.info("Reconnecting in %ds", backoff)
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
