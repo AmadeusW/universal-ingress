@@ -265,7 +265,7 @@ def integrate_event(event: dict[str, Any], cfg: dict[str, Any], logger: logging.
     entry_lines = [
         f"## {title}",
         "",
-        f"[[verbal]({rel_att_path})]",
+        f"[[{rel_att_path}|verbal]]",
         "",
         f"> {transcription.strip()}",
         "",
@@ -319,7 +319,7 @@ def invoke_hermes_for_event(
     prompt = f"""A new note was received via Universal Ingress from {source}:
 \"{transcription.strip()}\"
 
-Attachment: [[verbal]({rel_att_path})]
+Attachment: [[{rel_att_path}|verbal]]
 Daily Note: {daily_file}
 
 Please review the note:
