@@ -76,7 +76,7 @@ def load_config() -> dict[str, Any]:
             "daily_folder": "Daily",
             "attachments_folder": "Daily/attachments",
             "log_file": "Setup/universal-ingress.log",
-            "default_tags": ["ingress", "pebble"],
+            "default_tags": ["ingress"],
         }
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(default_cfg, indent=2) + "\n", encoding="utf-8")
@@ -322,10 +322,19 @@ def invoke_hermes_for_event(
 Attachment: [[{rel_att_path}|verbal]]
 Daily Note: {daily_file}
 
-Please review the note:
-1. Check if the note asks you to do something, asks a question, or has clear action items.
-2. If it is actionable and safe to do, perform the requested work or research.
-3. If actionable, update the entry under '# Received notes' in {daily_file} by placing your interpretation, answer, or findings between the attachment link and the blockquoted raw note (no horizontal line between interpretation and quote; keep the trailing '---' divider). If the interpretation is the same as the raw quote or no action is needed, no edit is required (leave only the quote).
+Your task is to review the note:
+1. The transcription may be both imperfect and literal. 
+Interpret what the author intended. Minimally rewrite fragments that need correction, only if needed. If not sure, mark it with [?] and follow with ["verbatim"] sentence.
+2. Synthesize a brief H2 header for the note entry, 
+follow with the attachment link and the blockquoted (potentially rewritten) note. 
+3. Check if the note asks you to do something, asks a question, or has clear action items.
+If it is actionable and safe to do, perform the requested work or research.
+4. Handle your answer (interpretation or findings):
+4.a Preface all assistant-written content with a robot emoji (🤖).
+4.b If the note or task refers to a specific project, append it there, and within the daily note print a link to there.
+4.c If the note is not related to any project, write your answer after the quote
+4.d If the interpretation is the same as the quote, no answer is required.
+5. Finish the note with the trailing '---' divider).
 """
     logger.info("Invoking Hermes for event from %s...", source)
     try:
